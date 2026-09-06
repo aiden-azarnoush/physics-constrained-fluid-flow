@@ -1,242 +1,167 @@
-# Physics-Constrained Deep Learning for Fluid Flows
+# Physics-Constrained Deep Learning for Fluid Flows (JAX)
 
-This repository contains a JAX implementation of physics-constrained deep learning for fluid flow surrogate modeling based on the paper:
+A clean JAX implementation of **surrogate modeling for fluid flows without
+simulation data**, after Sun, Gao, Pan & Wang (CMAME 2020). A neural
+network is trained to satisfy the steady incompressible Navier-Stokes
+equations at random points, with boundary conditions built into the
+network **exactly** rather than penalized — so the only training signal is
+physics. One file of library code, three runnable examples, one
+dependency (`jax`) beyond NumPy and matplotlib.
 
-> Sun, L., Gao, H., Pan, S., & Wang, J. X. (2020). Surrogate modeling for fluid flows based on physics-constrained deep learning without simulation data. Computer Methods in Applied Mechanics and Engineering, 361, 112732.
+<p align="center">
+<img src="figures/method.png" width="820" alt="Method: inputs → MLP → hard boundary conditions → Navier-Stokes residual loss">
+</p>
 
-## Installation
-
-### Prerequisites
-
-- Python 3.8+
-- JAX and JAX-compatible GPU (for acceleration)
-
-### Setup
-
-1. Clone this repository:
-```bash
-git clone https://github.com/azarnoush-aiden/physics-constrained-surrogate.git
-cd physics-constrained-surrogate
-```
-
-2. Create a virtual environment and install dependencies:
-```bash
-python -m venv env
-source env/bin/activate  # On Windows: env\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-## File Structure
-
-- `models.py`: Core neural network architecture implementations
-- `physics.py`: Physics residual computation using automatic differentiation
-- `boundary_conditions.py`: Boundary condition enforcement functions
-- `training.py`: Training loop and optimization utilities
-- `uncertainty.py`: Monte Carlo uncertainty quantification
-- `examples/`: Example scripts for different flow problems
-
-## Running the Examples
-
-### 1. Poiseuille Flow Verification
-
-The Poiseuille flow example demonstrates the basic capabilities on a simple flow with an analytical solution:
+## Run it
 
 ```bash
-python examples/poiseuille_flow.py
+pip install -r requirements.txt      # jax, numpy, matplotlib (CPU is fine)
+
+python check_physics.py              # 1. verify the physics code (seconds)
+python poiseuille.py                 # 2. flat channel vs. exact solution (~2 min)
+python stenosis.py                   # 3. parametric stenotic channel (~5-10 min)
+python uncertainty.py                # 4. Monte Carlo UQ with the model from step 3
 ```
 
-This will:
-- Create and train a physics-constrained neural network for Poiseuille flow
-- Compare the results with the analytical solution
-- Generate plots of the velocity profile and error distribution
-- Print performance metrics including MSE and training time
+> [!IMPORTANT]
+> Run `check_physics.py` first. It pushes the **exact** Poiseuille solution
+> through the same residual code the training uses and checks that all three
+> Navier-Stokes residuals vanish — and that a deliberately wrong profile is
+> rejected. If it prints `PASS` twice, the automatic-differentiation layer
+> is correct and everything else is just optimization.
 
-### 2. Stenotic Flow Example
+> [!TIP]
+> Everything runs on CPU. A GPU build of JAX makes the stenosis example
+> several times faster but is not required. Iteration counts are command-line
+> options (`--iters`), so you can do a quick smoke test with `--iters 500`.
 
-The stenotic flow example demonstrates the approach on a more complex geometry:
+## The idea
 
-```bash
-python examples/stenotic_flow.py --alpha 0.5
+Standard physics-informed networks add boundary-condition penalties to the
+loss and hope the optimizer balances them. The paper's approach removes the
+problem instead: write each field as a **particular solution** that already
+satisfies the Dirichlet conditions, plus a **distance function** that is
+zero on the boundary, times the network output:
+
+```math
+u = D(x,y)\,n_u, \qquad v = D(x,y)\,n_v, \qquad p = p_{part}(x) + x(L-x)\,n_p
 ```
 
-Parameters:
-- `--alpha`: Stenosis severity parameter (default: 0.5)
-- `--iterations`: Number of training iterations (default: 5000)
-- `--adaptive`: Enable adaptive sampling (default: True)
-- `--batch_size`: Collocation batch size (default: 1000)
-- `--save_dir`: Directory to save results (default: 'results')
+With $D = y\,(h(x) - y)$ the no-slip condition holds on both walls for
+*any* network weights, and with $p_{part} = \Delta p\,(1 - x/L)$ the inlet
+and outlet pressures are exact. There is nothing left to enforce, so the
+loss is just the momentum and continuity residuals at random collocation
+points:
 
-### 3. Uncertainty Quantification
-
-To run Monte Carlo uncertainty quantification on the stenotic flow model:
-
-```bash
-python examples/uncertainty_quantification.py --alpha_mean 0.5 --alpha_std 0.1 --samples 100
+```math
+\rho\,(u u_x + v u_y) + p_x - \mu\,(u_{xx} + u_{yy}) = 0, \qquad
+\rho\,(u v_x + v v_y) + p_y - \mu\,(v_{xx} + v_{yy}) = 0, \qquad
+u_x + v_y = 0
 ```
 
-Parameters:
-- `--alpha_mean`: Mean value of stenosis parameter (default: 0.5)
-- `--alpha_std`: Standard deviation of stenosis parameter (default: 0.1)
-- `--samples`: Number of Monte Carlo samples (default: 100)
-- `--model_path`: Path to pre-trained model (default: 'models/stenotic_model.pkl')
-- `--save_dir`: Directory to save results (default: 'results')
+<p align="center">
+<img src="figures/hard_bc_construction.png" width="820" alt="Distance function and collocation points on the stenotic domain">
+</p>
 
-## Using the Library
+> [!NOTE]
+> **How the derivatives are taken matters in JAX.** Each residual is
+> computed for a *single* point with `jax.grad` and `jax.hessian` of scalar
+> functions, then vectorized over the batch with `jax.vmap`. Taking
+> `jacfwd` of a batched function instead returns cross-sample Jacobians,
+> which silently gives wrong derivatives for every point but the first
+> (and costs O(N²) memory). `check_physics.py` exists to catch exactly
+> this class of mistake.
 
-### Training a Model
+## Examples
 
-```python
-import jax
-import jax.numpy as jnp
-from models import PINN
-from training import train_pinn, generate_collocation_points
+### 1. Poiseuille flow — validation against the exact solution
 
-# Define domain bounds
-domain_bounds = [(0.0, 1.0), (0.0, 1.0)]  # x and y bounds
+Pressure-driven flow between two plates. The exact solution is the
+parabola $u = \frac{\Delta p}{2\mu L}\,y(H-y)$, $v = 0$, $p$ linear. The
+script trains on physics alone, then reports the relative $L_2$ error of
+the velocity profile against the parabola and plots the fields.
 
-# Create model
-model = PINN(features=[20, 20, 20, 3])  # 3 layers with 20 neurons each
+<p align="center">
+<img src="figures/poiseuille_result.png" width="760" alt="Poiseuille: learned vs exact profile, loss history, u and p fields">
+</p>
 
-# Initialize training
-params, history = train_pinn(
-    model=model,
-    domain_bounds=domain_bounds,
-    rho=1.0,  # Density
-    mu=0.01,  # Viscosity
-    n_iterations=5000,
-    batch_size=1000,
-    learning_rate=1e-3,
-    adaptive_sampling=True,
-    adaptive_weighting=True
-)
+### 2. Stenotic channel — one network, many geometries
 
-# Save the trained model
-import pickle
-with open('trained_model.pkl', 'wb') as f:
-    pickle.dump((model, params), f)
+The constriction severity $\alpha$ in the upper wall
+$h(x) = H - \alpha\,e^{-50(x-0.5)^2}$ is an **input** to the network, so a
+single training run produces a surrogate over the whole range
+$\alpha \in [0.2, 0.6]$. The script plots speed and pressure for several
+$\alpha$ values from the same trained model.
+
+<p align="center">
+<img src="figures/stenosis_result.png" width="760" alt="Stenotic channel speed and pressure at several alpha">
+</p>
+
+### 3. Uncertainty quantification — free, once you have a surrogate
+
+Because $\alpha$ is an input, propagating a distribution of $\alpha$ costs
+one forward pass per sample. `uncertainty.py` draws
+$\alpha \sim \mathcal N(\text{mean}, \text{std}^2)$, evaluates the surrogate
+for each, and plots the mean and standard deviation of $u$ and $p$ — no
+re-training, no simulations.
+
+<p align="center">
+<img src="figures/uncertainty_result.png" width="760" alt="Monte Carlo mean and std of u and p over alpha">
+</p>
+
+> [!WARNING]
+> The three result figures above are produced by running the scripts; they
+> are committed to the repository after a run, so they show what the code
+> in that commit actually produced. Re-run and re-commit them if you
+> change the model or the training settings.
+
+## Files
+
+```
+pcnn.py             library: MLP, problems with hard BCs, residuals, training
+check_physics.py    residual-code verification with the exact Poiseuille solution
+poiseuille.py       example 1
+stenosis.py         example 2 (parametric geometry)
+uncertainty.py      example 3 (Monte Carlo over alpha; needs models/stenosis.pkl)
+figures/            images
 ```
 
-### Making Predictions
+### Adding your own geometry
 
-```python
-import jax
-import jax.numpy as jnp
-import numpy as np
-import matplotlib.pyplot as plt
-from models import PINN
+Subclass `Problem` in `pcnn.py`: give it `n_inputs`, a `sample(n, rng)`
+that returns collocation points inside the domain, and a
+`fields(params, xi)` that composes the network output with your distance
+function and particular solution. The residual and training code is
+geometry-agnostic.
 
-# Load trained model
-import pickle
-with open('trained_model.pkl', 'rb') as f:
-    model, params = pickle.load(f)
+> [!CAUTION]
+> Hard boundary conditions only cover **Dirichlet** conditions on
+> boundaries where you can write a distance function. Traction or
+> outflow conditions, and domains without a simple wall description,
+> need penalty terms or a different construction — see the paper's
+> discussion of general geometries.
 
-# Create a grid for prediction
-x = np.linspace(0, 1, 100)
-y = np.linspace(0, 1, 100)
-X, Y = np.meshgrid(x, y)
-points = np.stack([X.flatten(), Y.flatten()], axis=1)
+## Reference
 
-# Make predictions
-predictions = jax.vmap(lambda x: model.apply(params, x))(points)
-
-# Extract velocity components and pressure
-u = predictions[:, 0].reshape(X.shape)
-v = predictions[:, 1].reshape(X.shape)
-p = predictions[:, 2].reshape(X.shape)
-
-# Plot velocity magnitude
-vel_mag = np.sqrt(u**2 + v**2)
-plt.figure(figsize=(10, 8))
-plt.contourf(X, Y, vel_mag, 50, cmap='viridis')
-plt.colorbar(label='Velocity Magnitude')
-plt.title('Velocity Field')
-plt.xlabel('x')
-plt.ylabel('y')
-plt.savefig('velocity_field.png', dpi=300, bbox_inches='tight')
-plt.show()
-```
-
-### Running Uncertainty Quantification
-
-```python
-import jax
-import jax.numpy as jnp
-import numpy as np
-import matplotlib.pyplot as plt
-from uncertainty import monte_carlo_uq, plot_uncertainty
-from models import StenoticPINN
-
-# Load trained model
-import pickle
-with open('stenotic_model.pkl', 'rb') as f:
-    model, params = pickle.load(f)
-
-# Create a grid for prediction
-x = np.linspace(0, 1, 100)
-y = np.linspace(0, 1, 100)
-X, Y = np.meshgrid(x, y)
-points = np.stack([X.flatten(), Y.flatten()], axis=1)
-
-# Run Monte Carlo uncertainty quantification
-mean_pred, std_pred = monte_carlo_uq(
-    model=model, 
-    params=params, 
-    domain_points=points,
-    alpha_mean=0.5,
-    alpha_std=0.1,
-    num_samples=100
-)
-
-# Plot uncertainty results
-plot_uncertainty(points, mean_pred, std_pred, output_idx=0, save_path='uncertainty_u.png')
-plot_uncertainty(points, mean_pred, std_pred, output_idx=2, save_path='uncertainty_p.png')
-```
-
-## Performance Comparison
-
-The JAX implementation offers substantial performance improvements over the original PyTorch implementation:
-
-| Metric | PyTorch | JAX (Ours) |
-|--------|---------|------------|
-| Training Time (s) | 287.6 | 142.3 |
-| Memory Usage (MB) | 1,456 | 982 |
-| Final MSE | 1.5e-4 | 1.3e-4 |
-
-## Troubleshooting
-
-### CUDA/GPU Issues
-
-If you encounter GPU-related errors, you may need to install the appropriate version of JAX for your CUDA version:
-
-```bash
-# For CUDA 11.8
-pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-
-# For CUDA 12
-pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
-
-### Memory Issues
-
-If you encounter out-of-memory errors:
-- Reduce the batch size in `train_pinn`
-- Use a smaller network architecture
-- Disable JIT compilation temporarily for debugging with `jax.config.update("jax_disable_jit", True)`
-
-## Citation
-
-If you use this code in your research, please cite:
+Sun, L., Gao, H., Pan, S., & Wang, J.-X. (2020). Surrogate modeling for
+fluid flows based on physics-constrained deep learning without simulation
+data. *Computer Methods in Applied Mechanics and Engineering*, 361, 112732.
 
 ```
 @article{sun2020surrogate,
-  title={Surrogate modeling for fluid flows based on physics-constrained deep learning without simulation data},
-  author={Sun, Luning and Gao, Han and Pan, Shaowu and Wang, Jian-Xun},
-  journal={Computer Methods in Applied Mechanics and Engineering},
-  volume={361},
-  pages={112732},
-  year={2020},
-  publisher={Elsevier}
+  title   = {Surrogate modeling for fluid flows based on physics-constrained deep learning without simulation data},
+  author  = {Sun, Luning and Gao, Han and Pan, Shaowu and Wang, Jian-Xun},
+  journal = {Computer Methods in Applied Mechanics and Engineering},
+  volume  = {361},
+  pages   = {112732},
+  year    = {2020}
 }
 ```
+
+## Author
+
+**Aiden Azarnoush**
+
+## License
+
+MIT — see [LICENSE](LICENSE).
