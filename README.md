@@ -5,7 +5,7 @@ simulation data**, after Sun, Gao, Pan & Wang (CMAME 2020). A neural
 network is trained to satisfy the steady incompressible Navier-Stokes
 equations at random points, with boundary conditions built into the
 network **exactly** rather than penalized — so the only training signal is
-physics. One file of library code, three runnable examples, one
+physics. One file of library code, four runnable examples, one
 dependency (`jax`) beyond NumPy and matplotlib.
 
 <p align="center">
@@ -19,8 +19,9 @@ pip install -r requirements.txt      # jax, numpy, matplotlib (CPU is fine)
 
 python check_physics.py              # 1. verify the physics code (seconds)
 python poiseuille.py                 # 2. flat channel vs. exact solution (~2 min)
-python stenosis.py                   # 3. parametric stenotic channel (~5-10 min)
-python uncertainty.py                # 4. Monte Carlo UQ with the model from step 3
+python stenosis.py --alpha 0.3       # 3. one stenotic channel (~20 min)
+python stenosis.py                   # 4. parametric surrogate over alpha (~30 min)
+python uncertainty.py                # 5. Monte Carlo UQ with the model from step 4
 ```
 
 > [!IMPORTANT]
@@ -31,9 +32,10 @@ python uncertainty.py                # 4. Monte Carlo UQ with the model from ste
 > is correct and everything else is just optimization.
 
 > [!TIP]
-> Everything runs on CPU. A GPU build of JAX makes the stenosis example
+> Everything runs on CPU. A GPU build of JAX makes the stenosis examples
 > several times faster but is not required. Iteration counts are command-line
-> options (`--iters`), so you can do a quick smoke test with `--iters 500`.
+> options (`--iters` for Adam, `--lbfgs` for the refinement stage), so a quick
+> smoke test is `--iters 500 --lbfgs 200`.
 
 ## The idea
 
@@ -85,19 +87,50 @@ the velocity profile against the parabola and plots the fields.
 <img src="figures/poiseuille_result.png" width="760" alt="Poiseuille: learned vs exact profile, loss history, u and p fields">
 </p>
 
-### 2. Stenotic channel — one network, many geometries
+### 2. Stenotic channel — one geometry
 
-The constriction severity $\alpha$ in the upper wall
-$h(x) = H - \alpha\,e^{-50(x-0.5)^2}$ is an **input** to the network, so a
-single training run produces a surrogate over the whole range
-$\alpha \in [0.2, 0.6]$. The script plots speed and pressure for several
-$\alpha$ values from the same trained model.
+A Gaussian constriction of severity $\alpha$ in the upper wall,
+$h(x) = H - \alpha\,e^{-50(x-0.5)^2}$, with a parabolic inlet velocity,
+no-slip walls, and zero outlet pressure — all built into the network. The
+jet through the throat deflects toward the flat wall, and the pressure
+drops sharply across the constriction with a low-pressure pocket just
+downstream of the bump:
 
 <p align="center">
-<img src="figures/stenosis_result.png" width="760" alt="Stenotic channel speed and pressure at several alpha">
+<img src="figures/stenosis_alpha0.3_result.png" width="820" alt="Stenotic channel at alpha = 0.3: speed and pressure">
 </p>
 
-### 3. Uncertainty quantification — free, once you have a surrogate
+The script also prints the flow rate $\int u\,dy$ at the inlet, throat, and
+outlet. Mass conservation is a check the loss value cannot fake: the three
+numbers must agree (0.667 here).
+
+> [!IMPORTANT]
+> Adam alone stalls on this problem at a loss of order 0.3. The
+> **L-BFGS refinement** on a fixed set of collocation points then drives it
+> down another two orders of magnitude — this two-stage schedule is standard
+> for physics-informed networks and is what makes the throat resolve.
+> Collocation points are also concentrated around the throat, where the
+> gradients live.
+
+### 3. Parametric surrogate — one network, many geometries
+
+Make $\alpha$ an **input** to the network and a single training run gives
+the flow for every severity in $\alpha \in [0.1, 0.4]$. Same model, three
+geometries: the pressure drop climbs with severity and the throat speed
+rises with it, as continuity demands.
+
+<p align="center">
+<img src="figures/stenosis_result.png" width="760" alt="Parametric stenosis surrogate at several alpha">
+</p>
+
+> [!NOTE]
+> The parametric problem is genuinely harder than a single geometry (one
+> more input dimension, and the network must resolve the throat for every
+> $\alpha$ at once). The range is kept to $\alpha \le 0.4$ (40 % blockage)
+> where it converges cleanly; pushing to more severe constrictions needs
+> longer training or a larger network — try it with `--alpha-range`.
+
+### 4. Uncertainty quantification — free, once you have a surrogate
 
 Because $\alpha$ is an input, propagating a distribution of $\alpha$ costs
 one forward pass per sample. `uncertainty.py` draws
@@ -110,7 +143,7 @@ re-training, no simulations.
 </p>
 
 > [!WARNING]
-> The three result figures above are produced by running the scripts; they
+> The result figures above are produced by running the scripts; they
 > are committed to the repository after a run, so they show what the code
 > in that commit actually produced. Re-run and re-commit them if you
 > change the model or the training settings.
@@ -121,8 +154,8 @@ re-training, no simulations.
 pcnn.py             library: MLP, problems with hard BCs, residuals, training
 check_physics.py    residual-code verification with the exact Poiseuille solution
 poiseuille.py       example 1
-stenosis.py         example 2 (parametric geometry)
-uncertainty.py      example 3 (Monte Carlo over alpha; needs models/stenosis.pkl)
+stenosis.py         examples 2 and 3 (--alpha for one geometry, none for parametric)
+uncertainty.py      example 4 (Monte Carlo over alpha; needs models/stenosis.pkl)
 figures/            images
 ```
 
